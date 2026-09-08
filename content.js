@@ -1,0 +1,676 @@
+// Isolated-world content script. Owns all the actual work:
+//   - buffers network events reported by interceptor.js
+//   - turns one observed "open a posting" request into a reusable template
+//   - enumerates posting IDs off the job-search table
+//   - replays the template for every ID, parses the response, stores results
+// The popup is a thin remote control over this file via chrome.runtime messaging.
+
+const LOG = "[WWS]";
+const NET_BUFFER_MAX = 300;
+const ID_RE = /\b\d{5,7}\b/g;
+
+const state = {
+  net: [], // recent network events
+  learnStartedAt: 0,
+  learning: false,
+  rows: new Map(), // id -> { id, title, listFields }
+  results: new Map(), // id -> parsed posting
+  scraping: false,
+  abort: false,
+  progress: null,
+};
+
+// ---------------------------------------------------------------------------
+// small helpers
+// ---------------------------------------------------------------------------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const clean = (s) =>
+  String(s == null ? "" : s)
+    .replace(/ /g, " ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+function emit(msg) {
+  state.progress = msg;
+  try {
+    chrome.runtime.sendMessage({ type: "wws:progress", ...msg });
+  } catch (_) {
+    // popup closed — that's fine, the scrape keeps running
+  }
+}
+
+async function waitFor(pred, timeoutMs = 8000, stepMs = 200) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      if (pred()) return true;
+    } catch (_) {}
+    await sleep(stepMs);
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// network capture
+// ---------------------------------------------------------------------------
+window.addEventListener("message", (ev) => {
+  if (ev.source !== window) return;
+  const d = ev.data;
+  if (!d || d.__wws !== "WWS_NET" || !d.payload) return;
+  const e = { ...d.payload, at: Date.now(), i: state.net.length };
+  state.net.push(e);
+  if (state.net.length > NET_BUFFER_MAX) state.net.shift();
+});
+
+// Requests worth showing the user when they're hunting for the detail call.
+function interestingEvents(sinceTs) {
+  return state.net
+    .filter((e) => e.at >= sinceTs)
+    .filter((e) => {
+      if (e.error) return false;
+      const u = String(e.url || "");
+      if (/\.(css|js|png|jpg|jpeg|gif|svg|woff2?|ttf|ico)(\?|$)/i.test(u)) return false;
+      const blob = u + " " + (e.body || "");
+      const looksRelevant =
+        e.method !== "GET" ||
+        /job|posting|position|detail|view|search|info/i.test(blob);
+      const hasPayload = (e.preview || "").length > 200;
+      return looksRelevant && hasPayload;
+    })
+    .map((e) => ({
+      i: e.i,
+      kind: e.kind,
+      method: e.method,
+      url: e.url,
+      body: e.body ? e.body.slice(0, 600) : null,
+      status: e.status,
+      contentType: e.contentType,
+      bytes: (e.preview || "").length,
+      preview: (e.preview || "").slice(0, 240),
+      at: e.at,
+    }))
+    .reverse();
+}
+
+// ---------------------------------------------------------------------------
+// template building — turn one observed request into a parameterized one
+// ---------------------------------------------------------------------------
+function buildTemplate(eventIndex, explicitId) {
+  const e = state.net.find((x) => x.i === eventIndex);
+  if (!e) return { ok: false, error: "That request is no longer in the buffer." };
+
+  let body = e.body;
+  let contentType = null;
+  if (body && body.startsWith("[FormData] ")) {
+    body = body.slice("[FormData] ".length);
+    contentType = "application/x-www-form-urlencoded";
+  } else if (body && /^\[[A-Za-z]/.test(body)) {
+    return {
+      ok: false,
+      error: `Request body was ${body} — this extension can only replay text/urlencoded bodies.`,
+    };
+  } else if (body) {
+    contentType = /^\s*[{[]/.test(body)
+      ? "application/json"
+      : "application/x-www-form-urlencoded";
+  }
+
+  const haystack = `${e.url}\n${body || ""}`;
+  let id = explicitId ? String(explicitId).trim() : null;
+
+  if (!id) {
+    // Prefer a number that also appears as a posting ID in the visible table.
+    const known = new Set([...state.rows.keys(), ...scanCurrentPage().map((r) => r.id)]);
+    const found = [...new Set(haystack.match(ID_RE) || [])];
+    const matches = found.filter((n) => known.has(n));
+    if (matches.length === 1) id = matches[0];
+    else if (found.length === 1) id = found[0];
+    else
+      return {
+        ok: false,
+        needPostingId: true,
+        candidates: found.slice(0, 12),
+        error:
+          found.length === 0
+            ? "No posting ID found in that request."
+            : "Ambiguous posting ID — tell me which posting you opened.",
+      };
+  }
+
+  if (!haystack.includes(id)) {
+    return { ok: false, needPostingId: true, error: `ID ${id} doesn't appear in that request.` };
+  }
+
+  const template = {
+    method: e.method || "GET",
+    url: e.url.split(id).join("{{ID}}"),
+    body: body ? body.split(id).join("{{ID}}") : null,
+    contentType,
+    sampleId: id,
+    responseContentType: e.contentType || "",
+    capturedAt: Date.now(),
+  };
+  return { ok: true, template };
+}
+
+async function saveTemplate(template) {
+  await chrome.storage.local.set({ wws_detailTemplate: template });
+}
+async function loadTemplate() {
+  const { wws_detailTemplate } = await chrome.storage.local.get("wws_detailTemplate");
+  return wws_detailTemplate || null;
+}
+
+// ---------------------------------------------------------------------------
+// posting ID enumeration off the job-search table
+// ---------------------------------------------------------------------------
+function scanCurrentPage() {
+  const out = [];
+  const seen = new Set();
+  const trs = document.querySelectorAll('table tr, [role="row"]');
+
+  trs.forEach((tr) => {
+    const cellEls = tr.querySelectorAll('td, [role="cell"], [role="gridcell"]');
+    if (!cellEls.length) return;
+    const cells = [...cellEls].map((c) => clean(c.textContent));
+
+    const idIdx = cells.findIndex((c) => /^\d{5,7}$/.test(c));
+    if (idIdx === -1) return;
+    const id = cells[idIdx];
+    if (seen.has(id)) return;
+    seen.add(id);
+
+    const table = tr.closest("table");
+    const headers = table
+      ? [...table.querySelectorAll("thead th, thead td")].map((h) => clean(h.textContent))
+      : [];
+
+    const listFields = {};
+    cells.forEach((val, i) => {
+      if (!val) return;
+      const key = headers[i] ? headers[i] : `col${i}`;
+      listFields[key] = val;
+    });
+
+    const link = tr.querySelector("a");
+    out.push({
+      id,
+      title: link ? clean(link.textContent) : cells[idIdx + 1] || "",
+      listFields,
+    });
+  });
+
+  return out;
+}
+
+function firstRowId() {
+  const r = scanCurrentPage();
+  return r.length ? r[0].id : null;
+}
+
+function findNextPageButton() {
+  const cands = [...document.querySelectorAll('button, a, [role="button"]')];
+  return cands.find((el) => {
+    if (el.disabled || el.getAttribute("aria-disabled") === "true") return false;
+    if (el.offsetParent === null) return false; // not visible
+    const s = [
+      el.getAttribute("aria-label") || "",
+      el.title || "",
+      typeof el.className === "string" ? el.className : "",
+      clean(el.textContent).slice(0, 40),
+    ].join(" ");
+    return /\bnext\b|›|»|chevron[-_ ]?right|arrow[-_ ]?right|page[-_ ]?forward/i.test(s);
+  });
+}
+
+function mergeRows(rows) {
+  rows.forEach((r) => {
+    const prev = state.rows.get(r.id);
+    state.rows.set(r.id, prev ? { ...prev, ...r, listFields: { ...prev.listFields, ...r.listFields } } : r);
+  });
+}
+
+async function scanWithPagination(maxPages) {
+  state.abort = false;
+  for (let p = 0; p < maxPages; p++) {
+    mergeRows(scanCurrentPage());
+    emit({ phase: "ids", done: state.rows.size, total: 0, message: `page ${p + 1} · ${state.rows.size} IDs` });
+    if (state.abort) break;
+
+    const btn = findNextPageButton();
+    if (!btn) {
+      emit({ phase: "ids", done: state.rows.size, total: 0, message: `no next-page control found · ${state.rows.size} IDs` });
+      break;
+    }
+    const before = firstRowId();
+    btn.click();
+    const changed = await waitFor(() => firstRowId() && firstRowId() !== before, 10000);
+    if (!changed) {
+      emit({ phase: "ids", done: state.rows.size, total: 0, message: `last page · ${state.rows.size} IDs` });
+      break;
+    }
+    await sleep(700);
+  }
+  await persistRows();
+  emit({ phase: "ids", done: state.rows.size, total: 0, message: `done · ${state.rows.size} IDs`, finished: true });
+}
+
+async function persistRows() {
+  await chrome.storage.local.set({ wws_rows: Object.fromEntries(state.rows) });
+}
+async function persistResults() {
+  // Stored without rawHtml to keep storage sane; the download uses in-memory copies.
+  const slim = {};
+  for (const [id, v] of state.results) {
+    const { raw, ...rest } = v;
+    slim[id] = { ...rest, raw: { text: raw && raw.text ? raw.text : "" } };
+  }
+  await chrome.storage.local.set({ wws_results: slim });
+}
+
+// ---------------------------------------------------------------------------
+// detail parsing (format-agnostic: JSON or HTML, always keeps raw text)
+// ---------------------------------------------------------------------------
+function flattenJson(obj, prefix, out) {
+  if (obj == null) return out;
+  if (Array.isArray(obj)) {
+    if (obj.every((v) => v == null || typeof v !== "object")) {
+      out[prefix] = obj.join(", ");
+    } else {
+      obj.forEach((v, i) => flattenJson(v, `${prefix}[${i}]`, out));
+    }
+    return out;
+  }
+  if (typeof obj === "object") {
+    Object.entries(obj).forEach(([k, v]) => flattenJson(v, prefix ? `${prefix}.${k}` : k, out));
+    return out;
+  }
+  out[prefix] = obj;
+  return out;
+}
+
+function sectionText(h) {
+  const parts = [];
+  let n = h.nextElementSibling;
+  let hops = 0;
+  while (n && hops < 40) {
+    if (/^H[1-6]$/.test(n.tagName)) break;
+    if (n.querySelector && n.querySelector("h1,h2,h3,h4,h5,h6")) break;
+    const t = clean(n.textContent);
+    if (t) parts.push(t);
+    n = n.nextElementSibling;
+    hops++;
+  }
+  return parts.join("\n");
+}
+
+function parseDetail(text, contentType, sourceUrl, id, includeRawHtml) {
+  const out = {
+    id,
+    scrapedAt: new Date().toISOString(),
+    source: sourceUrl,
+    fields: {},
+    sections: {},
+    raw: {},
+  };
+
+  const ct = (contentType || "").toLowerCase();
+  if (ct.includes("json") || /^\s*[{[]/.test(text)) {
+    try {
+      const json = JSON.parse(text);
+      out.fields = flattenJson(json, "", {});
+      out.raw.json = json;
+      out.raw.text = clean(JSON.stringify(json)).slice(0, 200000);
+      return out;
+    } catch (_) {
+      // not really JSON — fall through to HTML parsing
+    }
+  }
+
+  const doc = new DOMParser().parseFromString(text, "text/html");
+  const kv = {};
+
+  // two-cell table rows: the dominant pattern in Orbis posting panels
+  doc.querySelectorAll("tr").forEach((tr) => {
+    const cells = tr.querySelectorAll("th, td");
+    if (cells.length !== 2) return;
+    const k = clean(cells[0].textContent);
+    const v = clean(cells[1].textContent);
+    if (k && v && k.length <= 120) kv[k] = v;
+  });
+
+  // definition lists
+  doc.querySelectorAll("dl").forEach((dl) => {
+    const dts = dl.querySelectorAll("dt");
+    const dds = dl.querySelectorAll("dd");
+    for (let i = 0; i < Math.min(dts.length, dds.length); i++) {
+      const k = clean(dts[i].textContent);
+      const v = clean(dds[i].textContent);
+      if (k && v) kv[k] = v;
+    }
+  });
+
+  // label/value sibling divs
+  doc.querySelectorAll('[class*="label"], [class*="key"]').forEach((el) => {
+    const k = clean(el.textContent);
+    const sib = el.nextElementSibling;
+    if (!k || k.length > 120 || !sib) return;
+    const cls = typeof sib.className === "string" ? sib.className : "";
+    if (!/value|content|data|desc/i.test(cls)) return;
+    const v = clean(sib.textContent);
+    if (v) kv[k] = v;
+  });
+
+  out.fields = kv;
+
+  doc.querySelectorAll("h1,h2,h3,h4,h5,h6").forEach((h) => {
+    const title = clean(h.textContent);
+    if (!title || title.length > 120) return;
+    const body = sectionText(h);
+    if (body && body.length > 20) out.sections[title] = body;
+  });
+
+  out.raw.text = clean(doc.body ? doc.body.textContent : text).slice(0, 200000);
+  if (includeRawHtml) out.raw.html = text;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// the scrape loop
+// ---------------------------------------------------------------------------
+function looksLikeLoginWall(text, url) {
+  return (
+    /central authentication service|duo security|sign in to waterloo|<title>[^<]*login/i.test(
+      text.slice(0, 4000)
+    ) || /login|adfs|auth/i.test(url)
+  );
+}
+
+async function fetchDetail(id, template) {
+  const url = template.url.split("{{ID}}").join(id);
+  const body = template.body ? template.body.split("{{ID}}").join(id) : undefined;
+  const headers = {};
+  if (template.contentType && body != null) headers["content-type"] = template.contentType;
+  headers["x-requested-with"] = "XMLHttpRequest";
+
+  const res = await fetch(url, {
+    method: template.method || "GET",
+    headers,
+    body,
+    credentials: "include",
+  });
+  const text = await res.text();
+  return { status: res.status, contentType: res.headers.get("content-type") || "", text, url: res.url || url };
+}
+
+async function scrapeAll({ delayMs = 1500, includeRawHtml = false, skipExisting = true }) {
+  const template = await loadTemplate();
+  if (!template) {
+    emit({ phase: "scrape", done: 0, total: 0, message: "No detail template learned yet.", finished: true, error: true });
+    return;
+  }
+
+  const ids = [...state.rows.keys()].filter((id) => !(skipExisting && state.results.has(id)));
+  state.scraping = true;
+  state.abort = false;
+
+  let done = 0;
+  let consecutiveFailures = 0;
+
+  for (const id of ids) {
+    if (state.abort) break;
+    try {
+      const r = await fetchDetail(id, template);
+
+      if (r.status >= 400 || looksLikeLoginWall(r.text, r.url)) {
+        consecutiveFailures++;
+        emit({
+          phase: "scrape",
+          done,
+          total: ids.length,
+          message: `id ${id}: HTTP ${r.status}${looksLikeLoginWall(r.text, r.url) ? " (login wall)" : ""}`,
+        });
+        if (consecutiveFailures >= 3) {
+          emit({
+            phase: "scrape",
+            done,
+            total: ids.length,
+            message:
+              "Stopped after 3 failures in a row. Your session or the captured token may have expired — reload WaterlooWorks and re-learn the template.",
+            finished: true,
+            error: true,
+          });
+          break;
+        }
+      } else {
+        consecutiveFailures = 0;
+        const parsed = parseDetail(r.text, r.contentType, r.url, id, includeRawHtml);
+        const row = state.rows.get(id);
+        parsed.listFields = row ? row.listFields : {};
+        parsed.title = (row && row.title) || parsed.fields["Job Title"] || "";
+        state.results.set(id, parsed);
+      }
+    } catch (err) {
+      consecutiveFailures++;
+      emit({ phase: "scrape", done, total: ids.length, message: `id ${id}: ${err}` });
+    }
+
+    done++;
+    if (done % 10 === 0) await persistResults();
+    emit({
+      phase: "scrape",
+      done,
+      total: ids.length,
+      message: `${done}/${ids.length} · ${state.results.size} stored`,
+    });
+
+    // jittered delay so we're not a metronome hammering their server
+    const jitter = delayMs * (0.7 + Math.random() * 0.6);
+    await sleep(jitter);
+  }
+
+  await persistResults();
+  state.scraping = false;
+  emit({
+    phase: "scrape",
+    done,
+    total: ids.length,
+    message: state.abort ? `stopped · ${state.results.size} stored` : `done · ${state.results.size} stored`,
+    finished: true,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// download (done here, not in a service worker, so Blob URLs are available)
+// ---------------------------------------------------------------------------
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.style.display = "none";
+  document.documentElement.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+const stamp = () => new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+
+// The panel asks for these payloads and writes them into the folder you picked.
+// Blob download is only the fallback when no folder is set.
+async function buildResultsPayload() {
+  const template = await loadTemplate();
+  return {
+    filename: `waterlooworks-postings-${stamp()}.json`,
+    data: {
+      meta: {
+        generatedAt: new Date().toISOString(),
+        count: state.results.size,
+        idsKnown: state.rows.size,
+        template: template ? { method: template.method, url: template.url } : null,
+      },
+      postings: [...state.results.values()],
+    },
+  };
+}
+
+async function buildRawPayload() {
+  const template = await loadTemplate();
+  if (!template) return { ok: false, error: "No template learned yet." };
+  const id = [...state.rows.keys()][0] || template.sampleId;
+  if (!id) return { ok: false, error: "No posting IDs known — scan the list first." };
+  const r = await fetchDetail(id, template);
+  return {
+    ok: true,
+    id,
+    status: r.status,
+    bytes: r.text.length,
+    filename: `waterlooworks-raw-${id}.json`,
+    data: {
+      id,
+      request: template,
+      status: r.status,
+      contentType: r.contentType,
+      finalUrl: r.url,
+      body: r.text,
+      parsed: parseDetail(r.text, r.contentType, r.url, id, false),
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// restore prior session state
+// ---------------------------------------------------------------------------
+(async () => {
+  const { wws_rows, wws_results } = await chrome.storage.local.get(["wws_rows", "wws_results"]);
+  if (wws_rows) Object.entries(wws_rows).forEach(([id, r]) => state.rows.set(id, r));
+  if (wws_results) Object.entries(wws_results).forEach(([id, r]) => state.results.set(id, r));
+  console.log(LOG, `restored ${state.rows.size} IDs, ${state.results.size} results`);
+})();
+
+// ---------------------------------------------------------------------------
+// popup message API
+// ---------------------------------------------------------------------------
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  (async () => {
+    switch (msg.cmd) {
+      case "state": {
+        const template = await loadTemplate();
+        sendResponse({
+          ok: true,
+          url: location.href,
+          hasTemplate: !!template,
+          template: template
+            ? { method: template.method, url: template.url, sampleId: template.sampleId }
+            : null,
+          idCount: state.rows.size,
+          resultCount: state.results.size,
+          scraping: state.scraping,
+          learning: state.learning,
+          progress: state.progress,
+        });
+        break;
+      }
+      case "learn:start":
+        state.learning = true;
+        state.learnStartedAt = Date.now();
+        sendResponse({ ok: true });
+        break;
+      case "learn:stop":
+        state.learning = false;
+        sendResponse({ ok: true });
+        break;
+      case "learn:get":
+        sendResponse({ ok: true, events: interestingEvents(state.learnStartedAt) });
+        break;
+      case "learn:pick": {
+        const r = buildTemplate(msg.eventIndex, msg.postingId);
+        if (r.ok) {
+          await saveTemplate(r.template);
+          state.learning = false;
+        }
+        sendResponse(r);
+        break;
+      }
+      case "ids:scanPage": {
+        mergeRows(scanCurrentPage());
+        await persistRows();
+        sendResponse({ ok: true, count: state.rows.size });
+        break;
+      }
+      case "ids:paginate":
+        scanWithPagination(msg.maxPages || 40);
+        sendResponse({ ok: true, started: true });
+        break;
+      case "ids:manual": {
+        const ids = String(msg.text || "").match(/\d{5,7}/g) || [];
+        ids.forEach((id) => {
+          if (!state.rows.has(id)) state.rows.set(id, { id, title: "", listFields: {} });
+        });
+        await persistRows();
+        sendResponse({ ok: true, count: state.rows.size, added: ids.length });
+        break;
+      }
+      case "ids:clear":
+        state.rows.clear();
+        await chrome.storage.local.remove("wws_rows");
+        sendResponse({ ok: true });
+        break;
+      case "scrape:start":
+        scrapeAll({
+          delayMs: msg.delayMs,
+          includeRawHtml: msg.includeRawHtml,
+          skipExisting: msg.skipExisting !== false,
+        });
+        sendResponse({ ok: true, started: true });
+        break;
+      case "scrape:stop":
+        state.abort = true;
+        sendResponse({ ok: true });
+        break;
+      case "results:getJson": {
+        const { filename, data } = await buildResultsPayload();
+        sendResponse({
+          ok: true,
+          filename,
+          json: JSON.stringify(data, null, 2),
+          count: state.results.size,
+        });
+        break;
+      }
+      case "debug:getRaw": {
+        const p = await buildRawPayload();
+        if (!p.ok) {
+          sendResponse(p);
+          break;
+        }
+        sendResponse({
+          ok: true,
+          filename: p.filename,
+          json: JSON.stringify(p.data, null, 2),
+          id: p.id,
+          status: p.status,
+          bytes: p.bytes,
+        });
+        break;
+      }
+      case "download:text":
+        downloadText(msg.filename, msg.text);
+        sendResponse({ ok: true });
+        break;
+      case "results:clear":
+        state.results.clear();
+        await chrome.storage.local.remove("wws_results");
+        sendResponse({ ok: true });
+        break;
+      default:
+        sendResponse({ ok: false, error: "unknown command " + msg.cmd });
+    }
+  })();
+  return true; // keep the channel open for the async response
+});
+
+console.log(LOG, "content script ready on", location.href);

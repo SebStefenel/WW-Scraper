@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "WaterlooWorks Scraper",
+  "version": "0.1.0",
+  "description": "Learn how WaterlooWorks loads job postings, then bulk-collect them to a local JSON file using your existing session.",
+  "permissions": ["storage", "unlimitedStorage"],
+  "host_permissions": ["https://waterlooworks.uwaterloo.ca/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "WaterlooWorks Scraper"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://waterlooworks.uwaterloo.ca/*"],
+      "js": ["interceptor.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://waterlooworks.uwaterloo.ca/*"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "world": "ISOLATED"
+    }
+  ]
+}
