@@ -135,29 +135,43 @@ async function refresh() {
     return;
   }
   setEnabled(true);
+
+  // The popup is a fresh context every time it opens, but learning mode lives in
+  // the content script — pick the polling back up so captures already made are
+  // still shown.
+  if (s.learning && !learnPoll) startLearnPoll();
+
   const tmpl = s.hasTemplate
     ? `<span class="ok">template ✓</span> <code>${s.template.method}</code>`
     : `<span class="err">no template</span>`;
+  const hooks = s.interceptorReady
+    ? `<span class="ok">hooks ✓</span>`
+    : `<span class="err">hooks ✗ — reload the WW page</span>`;
   $("status").innerHTML =
-    `${tmpl} · <b>${s.idCount}</b> IDs · <b>${s.resultCount}</b> scraped` +
+    `${hooks} · ${tmpl} · <b>${s.idCount}</b> IDs · <b>${s.resultCount}</b> scraped` +
+    ` · <b>${s.captured || 0}</b> captured` +
     (s.scraping ? ' · <b>scraping…</b>' : "") +
     (s.progress && s.progress.message ? `<br><span style="color:var(--muted)">${s.progress.message}</span>` : "");
 }
 
-function renderEvents(events) {
+function renderEvents(events, currentUrl) {
   const box = $("events");
   box.innerHTML = "";
   if (!events.length) {
-    box.innerHTML = '<div class="hint">Waiting… open a job posting on the page.</div>';
+    box.innerHTML =
+      '<div class="hint">Nothing captured yet. Open a posting on the WaterlooWorks tab. ' +
+      "If the page navigated and still nothing appears, tick <b>show all requests</b>, or use " +
+      "<b>Use current page as template</b> while the posting is on screen.</div>";
     return;
   }
-  events.slice(0, 12).forEach((e) => {
+  events.slice(0, 15).forEach((e) => {
     const div = document.createElement("div");
     div.className = "ev";
     const short = e.url.replace(/^https?:\/\/[^/]+/, "");
+    const kind = e.kind === "form" ? '<b>form submit</b> · ' : "";
     div.innerHTML = `
       <div class="m">${e.method} ${short}</div>
-      <div class="meta">${e.status} · ${e.contentType.split(";")[0] || "?"} · ${e.bytes}b${
+      <div class="meta">${kind}${e.status || ""} ${e.contentType.split(";")[0] || ""} · ${e.bytes}b${
       e.body ? " · body: " + e.body.slice(0, 90).replace(/</g, "&lt;") : ""
     }</div>`;
     const btn = document.createElement("button");
@@ -192,8 +206,8 @@ function startLearnPoll() {
   stopLearnPoll();
   learnPoll = setInterval(async () => {
     try {
-      const r = await send("learn:get");
-      renderEvents(r.events || []);
+      const r = await send("learn:get", { showAll: $("showAll").checked });
+      renderEvents(r.events || [], r.currentUrl);
     } catch (_) {}
   }, 1200);
 }
@@ -213,6 +227,27 @@ $("learnStop").onclick = async () => {
   stopLearnPoll();
   log("Stopped learning.");
 };
+
+async function usePage(postingId) {
+  const r = await send("learn:fromPage", { postingId });
+  if (r.ok) {
+    log(`Template set from the current page (sample ID ${r.template.sampleId}).`, "ok");
+    stopLearnPoll();
+    $("events").innerHTML = "";
+    refresh();
+    return;
+  }
+  if (r.needPostingId) {
+    const answer = prompt(
+      `${r.error}\n\nNumbers in the URL: ${(r.candidates || []).join(", ")}`
+    );
+    if (answer) return usePage(answer.trim());
+    return;
+  }
+  log(r.error, "err");
+}
+
+$("usePage").onclick = () => usePage();
 
 $("scanPage").onclick = async () => {
   const r = await send("ids:scanPage");

@@ -6,11 +6,20 @@
   const TAG = "WWS_NET";
   const ORIGIN = window.location.origin;
 
+  // This file is installed twice on purpose — declared as a MAIN-world content
+  // script (fast, but needs Chrome 111+ and has had ordering bugs) and injected
+  // as a <script> tag by content.js (works everywhere). Whichever wins, patch once.
+  if (window.__wwsInstalled) return;
+  window.__wwsInstalled = true;
+
   const post = (payload) => {
     try {
       window.postMessage({ __wws: TAG, payload }, ORIGIN);
     } catch (_) {}
   };
+
+  // Lets the panel show whether hooks are actually live in the page.
+  post({ kind: "__ready", url: location.href });
 
   const summarizeBody = (body) => {
     if (body == null) return null;
@@ -82,6 +91,41 @@
     this.__wws = { method: String(method || "GET").toUpperCase(), url: String(url) };
     return origOpen.apply(this, arguments);
   };
+
+  // ---- form submissions ----------------------------------------------------
+  // Orbis opens a posting by submitting a hidden form, which is a document
+  // navigation rather than fetch/XHR — invisible to the hooks above. Capture it
+  // on the way out so the posting request survives the page unload.
+  document.addEventListener(
+    "submit",
+    (ev) => {
+      const form = ev.target;
+      if (!form || form.tagName !== "FORM") return;
+      try {
+        const fd = new FormData(form);
+        // include the button that triggered the submit; Orbis often keys off it
+        const sub = ev.submitter;
+        if (sub && sub.name) fd.append(sub.name, sub.value || "");
+
+        const pairs = [...fd.entries()]
+          .map(
+            ([k, v]) =>
+              `${encodeURIComponent(k)}=${encodeURIComponent(typeof v === "string" ? v : "")}`
+          )
+          .join("&");
+
+        const method = String(form.method || "GET").toUpperCase();
+        let url = form.action || window.location.href;
+        let body = pairs;
+        if (method === "GET") {
+          url += (url.includes("?") ? "&" : "?") + pairs;
+          body = null;
+        }
+        post({ kind: "form", url, method, body, status: 0, contentType: "", preview: "" });
+      } catch (_) {}
+    },
+    true // capture phase, so we see it even if the page stops propagation
+  );
 
   XHR.prototype.send = function (body) {
     const meta = this.__wws || {};

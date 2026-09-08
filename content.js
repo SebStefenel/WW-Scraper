@@ -11,6 +11,8 @@ const ID_RE = /\b\d{5,7}\b/g;
 
 const state = {
   net: [], // recent network events
+  netSeq: 0, // monotonic id; array indices shift as the buffer rolls
+  interceptorReady: false,
   learnStartedAt: 0,
   learning: false,
   rows: new Map(), // id -> { id, title, listFields }
@@ -54,29 +56,67 @@ async function waitFor(pred, timeoutMs = 8000, stepMs = 200) {
 // ---------------------------------------------------------------------------
 // network capture
 // ---------------------------------------------------------------------------
+let netSaveTimer = null;
+
+// While learning we mirror the buffer to storage, because the request that
+// opens a posting is usually a navigation — the page unloads a moment later and
+// would otherwise take the capture with it.
+function persistNetLog() {
+  clearTimeout(netSaveTimer);
+  netSaveTimer = setTimeout(() => {
+    chrome.storage.local.set({
+      wws_netlog: state.net.slice(-80),
+      wws_learn: { learning: state.learning, startedAt: state.learnStartedAt },
+    });
+  }, 250);
+}
+
+// Backstop for the MAIN-world content script, which some Chrome builds either
+// don't support or run too late to catch the page's own network calls.
+(function injectInterceptor() {
+  try {
+    const s = document.createElement("script");
+    s.src = chrome.runtime.getURL("interceptor.js");
+    s.onload = () => s.remove();
+    (document.head || document.documentElement).appendChild(s);
+  } catch (err) {
+    console.warn(LOG, "interceptor injection failed", err);
+  }
+})();
+
 window.addEventListener("message", (ev) => {
   if (ev.source !== window) return;
   const d = ev.data;
   if (!d || d.__wws !== "WWS_NET" || !d.payload) return;
-  const e = { ...d.payload, at: Date.now(), i: state.net.length };
+
+  if (d.payload.kind === "__ready") {
+    state.interceptorReady = true;
+    console.log(LOG, "interceptor active in page");
+    return;
+  }
+
+  const e = { ...d.payload, at: Date.now(), i: state.netSeq++ };
   state.net.push(e);
   if (state.net.length > NET_BUFFER_MAX) state.net.shift();
+  if (state.learning) persistNetLog();
 });
 
 // Requests worth showing the user when they're hunting for the detail call.
-function interestingEvents(sinceTs) {
+function interestingEvents(sinceTs, showAll) {
   return state.net
     .filter((e) => e.at >= sinceTs)
     .filter((e) => {
       if (e.error) return false;
       const u = String(e.url || "");
       if (/\.(css|js|png|jpg|jpeg|gif|svg|woff2?|ttf|ico)(\?|$)/i.test(u)) return false;
+      if (showAll) return true;
+      // Form submits are navigations: they never have a response body here, so
+      // judging them on payload size would hide exactly what we're after.
+      if (e.kind === "form") return true;
       const blob = u + " " + (e.body || "");
       const looksRelevant =
-        e.method !== "GET" ||
-        /job|posting|position|detail|view|search|info/i.test(blob);
-      const hasPayload = (e.preview || "").length > 200;
-      return looksRelevant && hasPayload;
+        e.method !== "GET" || /job|posting|position|detail|view|search|info/i.test(blob);
+      return looksRelevant && (e.preview || "").length > 200;
     })
     .map((e) => ({
       i: e.i,
@@ -545,10 +585,28 @@ async function buildRawPayload() {
 // restore prior session state
 // ---------------------------------------------------------------------------
 (async () => {
-  const { wws_rows, wws_results } = await chrome.storage.local.get(["wws_rows", "wws_results"]);
+  const { wws_rows, wws_results, wws_netlog, wws_learn } = await chrome.storage.local.get([
+    "wws_rows",
+    "wws_results",
+    "wws_netlog",
+    "wws_learn",
+  ]);
   if (wws_rows) Object.entries(wws_rows).forEach(([id, r]) => state.rows.set(id, r));
   if (wws_results) Object.entries(wws_results).forEach(([id, r]) => state.results.set(id, r));
-  console.log(LOG, `restored ${state.rows.size} IDs, ${state.results.size} results`);
+
+  // Carry a learning session across the navigation it just triggered.
+  if (wws_learn && wws_learn.learning) {
+    state.learning = true;
+    state.learnStartedAt = wws_learn.startedAt || 0;
+    if (Array.isArray(wws_netlog) && wws_netlog.length) {
+      state.net = wws_netlog.slice();
+      state.netSeq = Math.max(...wws_netlog.map((e) => e.i || 0)) + 1;
+    }
+  }
+  console.log(
+    LOG,
+    `restored ${state.rows.size} IDs, ${state.results.size} results, ${state.net.length} captured`
+  );
 })();
 
 // ---------------------------------------------------------------------------
@@ -562,6 +620,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({
           ok: true,
           url: location.href,
+          interceptorReady: state.interceptorReady,
+          captured: state.net.length,
           hasTemplate: !!template,
           template: template
             ? { method: template.method, url: template.url, sampleId: template.sampleId }
@@ -577,15 +637,60 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       case "learn:start":
         state.learning = true;
         state.learnStartedAt = Date.now();
+        state.net = [];
+        persistNetLog();
         sendResponse({ ok: true });
         break;
       case "learn:stop":
         state.learning = false;
+        persistNetLog();
         sendResponse({ ok: true });
         break;
       case "learn:get":
-        sendResponse({ ok: true, events: interestingEvents(state.learnStartedAt) });
+        sendResponse({
+          ok: true,
+          events: interestingEvents(state.learnStartedAt, msg.showAll),
+          currentUrl: location.href,
+        });
         break;
+      case "learn:fromPage": {
+        // Fallback for when a posting is just a URL: use this page as the
+        // template, with the posting ID in the address swapped for {{ID}}.
+        const url = location.href;
+        const known = new Set(state.rows.keys());
+        const found = [...new Set(url.match(ID_RE) || [])];
+        let id = msg.postingId ? String(msg.postingId).trim() : null;
+        if (!id) {
+          const hits = found.filter((n) => known.has(n));
+          if (hits.length === 1) id = hits[0];
+          else if (found.length === 1) id = found[0];
+        }
+        if (!id || !url.includes(id)) {
+          sendResponse({
+            ok: false,
+            needPostingId: found.length > 0,
+            candidates: found.slice(0, 12),
+            error:
+              found.length === 0
+                ? "This page's URL contains no posting ID, so it can't be used as a template. The posting must be loaded by a form POST — use one of the captured requests instead."
+                : "Tell me which posting ID this page is showing.",
+          });
+          break;
+        }
+        const template = {
+          method: "GET",
+          url: url.split(id).join("{{ID}}"),
+          body: null,
+          contentType: null,
+          sampleId: id,
+          responseContentType: "text/html",
+          capturedAt: Date.now(),
+        };
+        await saveTemplate(template);
+        state.learning = false;
+        sendResponse({ ok: true, template });
+        break;
+      }
       case "learn:pick": {
         const r = buildTemplate(msg.eventIndex, msg.postingId);
         if (r.ok) {

@@ -9,6 +9,12 @@
     "default_popup": "popup.html",
     "default_title": "WaterlooWorks Scraper"
   },
+  "web_accessible_resources": [
+    {
+      "resources": ["interceptor.js"],
+      "matches": ["https://waterlooworks.uwaterloo.ca/*"]
+    }
+  ],
   "content_scripts": [
     {
       "matches": ["https://waterlooworks.uwaterloo.ca/*"],
