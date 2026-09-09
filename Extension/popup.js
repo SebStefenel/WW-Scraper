@@ -324,7 +324,7 @@ $("save").onclick = saveResults;
 // ResuForge's WaterlooWorks section reads the same JSON this panel saves, so
 // the export is: write the file, then open the import page. The file never goes
 // through a server — it's picked up from disk by the page you're sent to.
-const RESUFORGE_DEFAULT = "https://frontend-ten-green-31.vercel.app";
+const RESUFORGE_DEFAULT = "https://resuforge-app.vercel.app";
 const RESUFORGE_KEY = "wws_resuforge_url";
 
 async function resuforgeBase() {
