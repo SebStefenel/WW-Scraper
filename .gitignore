@@ -1,6 +1,9 @@
 # Scraped output — job data and anything revealing local paths stays out of git.
 waterlooworks-postings-*.json
 waterlooworks-raw-*.json
+waterlooworks-listdom.json
+postings.clean.json
+postings.csv
 out/
 *.local.json
 
