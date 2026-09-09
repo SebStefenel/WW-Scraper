@@ -205,20 +205,28 @@ async function loadTemplate() {
 // ---------------------------------------------------------------------------
 // posting ID enumeration off the job-search table
 // ---------------------------------------------------------------------------
+// Row shape (Vue-rendered):
+//   <tr class="table__row--body">
+//     <th scope="row"> … <input name="dataViewerSelection" value="485614"> …
+//                        <span class="overflow--ellipsis">485614</span> </th>
+//     <td class="table__value"><a class="overflow--ellipsis">Job Title</a></td>
+//     … 7 more <td> …
+// The ID has to come off the checkbox: the <th>'s own text also contains
+// "Select Row" plus the material-icon names of its four action buttons.
 function scanCurrentPage() {
   const out = [];
   const seen = new Set();
-  const trs = document.querySelectorAll('table tr, [role="row"]');
 
-  trs.forEach((tr) => {
-    const cellEls = tr.querySelectorAll('td, [role="cell"], [role="gridcell"]');
-    if (!cellEls.length) return;
-    const cells = [...cellEls].map((c) => clean(c.textContent));
-
-    const idIdx = cells.findIndex((c) => /^\d{5,7}$/.test(c));
-    if (idIdx === -1) return;
-    const id = cells[idIdx];
-    if (seen.has(id)) return;
+  document.querySelectorAll("tr.table__row--body, tbody tr").forEach((tr) => {
+    const cb = tr.querySelector(
+      'input[name="dataViewerSelection"], input[id^="resultRow_"]'
+    );
+    let id = cb ? clean(cb.value || "") : "";
+    if (!/^\d{5,7}$/.test(id)) {
+      const m = /resultRow_(\d{5,7})/.exec(tr.innerHTML || "");
+      id = m ? m[1] : "";
+    }
+    if (!/^\d{5,7}$/.test(id) || seen.has(id)) return;
     seen.add(id);
 
     const table = tr.closest("table");
@@ -227,16 +235,21 @@ function scanCurrentPage() {
       : [];
 
     const listFields = {};
-    cells.forEach((val, i) => {
+    [...tr.querySelectorAll("th, td")].forEach((cell, i) => {
+      // the ellipsis span/anchor holds just the display value, without the
+      // surrounding checkbox label and icon glyph names
+      const inner = cell.querySelector(".overflow--ellipsis");
+      const val = clean(inner ? inner.textContent : cell.textContent);
       if (!val) return;
-      const key = headers[i] ? headers[i] : `col${i}`;
+      const key = headers[i] || `col${i}`;
       listFields[key] = val;
     });
+    listFields.ID = id;
 
-    const link = tr.querySelector("a");
+    const link = tr.querySelector("td a");
     out.push({
       id,
-      title: link ? clean(link.textContent) : cells[idIdx + 1] || "",
+      title: link ? clean(link.textContent) : listFields["Job Title"] || "",
       listFields,
     });
   });
@@ -253,14 +266,23 @@ function findNextPageButton() {
   const cands = [...document.querySelectorAll('button, a, [role="button"]')];
   return cands.find((el) => {
     if (el.disabled || el.getAttribute("aria-disabled") === "true") return false;
+    const cls = typeof el.className === "string" ? el.className : "";
+    if (/disabled/i.test(cls)) return false;
     if (el.offsetParent === null) return false; // not visible
+
     const s = [
       el.getAttribute("aria-label") || "",
       el.title || "",
-      typeof el.className === "string" ? el.className : "",
-      clean(el.textContent).slice(0, 40),
+      cls,
+      clean(el.textContent).slice(0, 40), // material-icons render as their glyph name
     ].join(" ");
-    return /\bnext\b|›|»|chevron[-_ ]?right|arrow[-_ ]?right|page[-_ ]?forward/i.test(s);
+
+    // "last page" / "»" would skip straight to the end, and "previous" walks
+    // backwards — both must lose to an actual next control.
+    if (/\b(last|first|prev|previous|back)\b|«|»|‹|skip[-_ ]?to/i.test(s)) return false;
+    return /\bnext\b|navigate[-_ ]?next|chevron[-_ ]?right|keyboard[-_ ]?arrow[-_ ]?right|arrow[-_ ]?forward|›/i.test(
+      s
+    );
   });
 }
 
