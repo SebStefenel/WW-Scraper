@@ -4,7 +4,7 @@
  *
  *   node tools/clean.js [files...] [--out DIR] [--keep-raw] [--no-csv]
  *
- * With no files given it picks up every waterlooworks-postings-*.json in the
+ * With no files given it picks up every waterlooworks-postings*.json in the
  * current directory, merges them, and de-duplicates by posting ID (newest
  * scrape wins) — so re-running a partial scrape and a full one is safe.
  *
@@ -254,7 +254,8 @@ function main() {
   if (!files.length) {
     files = fs
       .readdirSync(".")
-      .filter((f) => /^waterlooworks-postings-.*\.json$/.test(f))
+      // matches both the current stable name and older timestamped exports
+      .filter((f) => /^waterlooworks-postings.*\.json$/.test(f))
       .sort();
   }
   if (!files.length) {

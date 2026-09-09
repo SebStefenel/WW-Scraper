@@ -297,11 +297,25 @@ $("clearFolder").onclick = async () => {
   log("Output folder cleared.");
 };
 
+let savingNow = false;
+
 async function saveResults() {
-  const r = await send("results:getJson");
-  if (!r.ok) return log(r.error, "err");
-  if (!r.count) return log("Nothing scraped yet.", "err");
-  await saveJson(r.filename, r.json);
+  if (savingNow) return log("A save is already in progress.");
+  savingNow = true;
+  try {
+    // The destination is part of the dedupe key, so picking a new output folder
+    // and saving again is a real save rather than a suppressed duplicate.
+    const target = dirHandle ? dirHandle.name : "download";
+    const r = await send("results:getJson", { target });
+    if (!r.ok) return log(r.error, "err");
+    if (r.skipped) {
+      return log(`Already saved ${Math.round(r.sinceMs / 1000)}s ago — nothing new to write.`);
+    }
+    if (!r.count) return log("Nothing scraped yet.", "err");
+    await saveJson(r.filename, r.json);
+  } finally {
+    savingNow = false;
+  }
 }
 
 $("save").onclick = saveResults;

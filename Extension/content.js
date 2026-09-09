@@ -621,6 +621,13 @@ async function scrapeAll({ delayMs = 1500, includeRawHtml = false, skipExisting 
     return;
   }
 
+  // Without this, a second click runs an overlapping loop against the same
+  // results Map and emits a second finish event — i.e. a second auto-save.
+  if (state.scraping) {
+    emit({ phase: "scrape", done: 0, total: 0, message: "A scrape is already running." });
+    return;
+  }
+
   const ids = [...state.rows.keys()].filter((id) => !(skipExisting && state.results.has(id)));
   state.scraping = true;
   state.abort = false;
@@ -707,14 +714,31 @@ function downloadText(filename, text) {
   setTimeout(() => URL.revokeObjectURL(url), 30000);
 }
 
-const stamp = () => new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+// A stable filename, deliberately: a timestamped one turns every re-save into a
+// new file, so duplicates accumulate by construction. Overwriting is idempotent,
+// and meta.generatedAt still records when the export was built.
+const RESULTS_FILENAME = "waterlooworks-postings.json";
+
+// How long after a save a request for the same data, to the same destination,
+// is treated as redundant. Covers the auto-save-then-manual-click sequence and
+// the case where two panel contexts both react to the same finish event.
+const SAVE_DEDUPE_MS = 60000;
+
+// count + newest scrapedAt: changes exactly when there is new data to write.
+function resultsSignature() {
+  let newest = "";
+  for (const r of state.results.values()) {
+    if (r.scrapedAt && r.scrapedAt > newest) newest = r.scrapedAt;
+  }
+  return `${state.results.size}:${newest}`;
+}
 
 // The panel asks for these payloads and writes them into the folder you picked.
 // Blob download is only the fallback when no folder is set.
 async function buildResultsPayload() {
   const template = await loadTemplate();
   return {
-    filename: `waterlooworks-postings-${stamp()}.json`,
+    filename: RESULTS_FILENAME,
     data: {
       meta: {
         generatedAt: new Date().toISOString(),
@@ -907,6 +931,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({ ok: true });
         break;
       case "results:getJson": {
+        // The claim below is synchronous, before any await, so two requests
+        // arriving back-to-back cannot both get through and race each other
+        // writing the same file.
+        const sig = `${resultsSignature()}@${msg.target || "?"}`;
+        const last = state.lastSaved;
+        if (last && last.sig === sig && Date.now() - last.at < SAVE_DEDUPE_MS) {
+          sendResponse({
+            ok: true,
+            skipped: true,
+            count: state.results.size,
+            sinceMs: Date.now() - last.at,
+          });
+          break;
+        }
+        state.lastSaved = { sig, at: Date.now() };
+
         const { filename, data } = await buildResultsPayload();
         sendResponse({
           ok: true,
