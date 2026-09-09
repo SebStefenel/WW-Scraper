@@ -123,7 +123,7 @@ function interestingEvents(sinceTs, showAll) {
       kind: e.kind,
       method: e.method,
       url: e.url,
-      body: e.body ? e.body.slice(0, 600) : null,
+      body: e.body ? e.body.slice(0, 1500) : null,
       status: e.status,
       contentType: e.contentType,
       bytes: (e.preview || "").length,
@@ -271,8 +271,72 @@ function mergeRows(rows) {
   });
 }
 
+// Reports where posting IDs actually live in the DOM, so row detection can be
+// written against the real markup instead of guessed at.
+function debugListDom() {
+  const info = {
+    url: location.href,
+    title: document.title,
+    iframes: document.querySelectorAll("iframe").length,
+    tables: [],
+    idNodes: [],
+    rowSample: "",
+    scanFound: scanCurrentPage().length,
+  };
+
+  document.querySelectorAll('table, [role="table"], [role="grid"]').forEach((t, i) => {
+    info.tables.push({
+      i,
+      tag: t.tagName.toLowerCase(),
+      cls: String(t.className || "").slice(0, 140),
+      rows: t.querySelectorAll('tr, [role="row"]').length,
+      cells: t.querySelectorAll('td, [role="cell"], [role="gridcell"]').length,
+    });
+  });
+
+  // anything with a shadow root would be invisible to querySelectorAll
+  let shadowHosts = 0;
+  document.querySelectorAll("*").forEach((el) => {
+    if (el.shadowRoot) shadowHosts++;
+  });
+  info.shadowHosts = shadowHosts;
+
+  const describe = (el) =>
+    el.tagName.toLowerCase() +
+    (el.className && typeof el.className === "string"
+      ? "." + el.className.trim().split(/\s+/).slice(0, 3).join(".")
+      : "");
+
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let node;
+  while ((node = walker.nextNode()) && info.idNodes.length < 10) {
+    const t = (node.nodeValue || "").trim();
+    if (!/^\d{5,7}$/.test(t)) continue;
+    const chain = [];
+    let el = node.parentElement;
+    for (let h = 0; el && h < 7; h++) {
+      chain.push(describe(el));
+      el = el.parentElement;
+    }
+    info.idNodes.push({ id: t, chain });
+    if (!info.rowSample) {
+      // walk up to something row-shaped and capture its markup
+      let row = node.parentElement;
+      for (let h = 0; row && h < 6; h++) {
+        if (row.tagName === "TR" || row.getAttribute("role") === "row") break;
+        row = row.parentElement;
+      }
+      row = row || node.parentElement;
+      info.rowSample = (row.outerHTML || "").slice(0, 12000);
+    }
+  }
+
+  return info;
+}
+
 async function scanWithPagination(maxPages) {
-  state.abort = false;
+  if (state.scanning) return; // clicking the button twice must not race
+  state.scanning = true;
   for (let p = 0; p < maxPages; p++) {
     mergeRows(scanCurrentPage());
     emit({ phase: "ids", done: state.rows.size, total: 0, message: `page ${p + 1} · ${state.rows.size} IDs` });
@@ -293,6 +357,7 @@ async function scanWithPagination(maxPages) {
     await sleep(700);
   }
   await persistRows();
+  state.scanning = false;
   emit({ phase: "ids", done: state.rows.size, total: 0, message: `done · ${state.rows.size} IDs`, finished: true });
 }
 
@@ -330,6 +395,26 @@ function flattenJson(obj, prefix, out) {
   return out;
 }
 
+// textContent flattens <br> and <li> into an unreadable run-on, which matters
+// for the long prose fields (summary, responsibilities, skills). Rebuild the
+// line breaks the markup implies.
+function richText(el) {
+  if (!el) return "";
+  const c = el.cloneNode(true);
+  // Interactive chrome ("View Targeted Degrees and Disciplines") is not content.
+  c.querySelectorAll("script, style, button, noscript").forEach((e) => e.remove());
+  c.querySelectorAll("br").forEach((br) => br.replaceWith("\n"));
+  c.querySelectorAll("li").forEach((li) => li.prepend("• "));
+  c.querySelectorAll("li, p, div, tr").forEach((b) => b.append("\n"));
+  // Orbis nests wrapper divs many levels deep, which yields runs of blank lines.
+  return clean(c.textContent)
+    .split("\n")
+    .map((l) => l.trim())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function sectionText(h) {
   const parts = [];
   let n = h.nextElementSibling;
@@ -345,12 +430,57 @@ function sectionText(h) {
   return parts.join("\n");
 }
 
+// WaterlooWorks renders every posting field as:
+//   <div class="tag__key-value-list">
+//     <span class="label">Work Term:</span>
+//     <p>2027 - Winter</p>          <- or a nested <table> for multi-value
+//   </div>
+// grouped into <div class="panel"> sections titled by <h4 class="heading--banner">.
+function parseWaterlooWorks(doc, out) {
+  const blocks = doc.querySelectorAll(".tag__key-value-list");
+  if (!blocks.length) return false;
+
+  blocks.forEach((block) => {
+    const labelEl = block.querySelector("span.label, .label");
+    if (!labelEl) return;
+    const key = clean(labelEl.textContent).replace(/\s*:\s*$/, "");
+    if (!key) return;
+
+    // Read from the whole block, not from the <p>. Multi-value fields nest a
+    // <table>, and HTML parsing forbids a <table>/<div> inside <p> — the browser
+    // auto-closes the paragraph, leaving the real value as its sibling.
+    const cells = block.querySelectorAll("td.table__value, td");
+    let value;
+    if (cells.length) {
+      const list = [...cells].map((c) => clean(c.textContent)).filter(Boolean);
+      value = list.length === 1 ? list[0] : list;
+    } else {
+      const copy = block.cloneNode(true);
+      copy.querySelectorAll(".label").forEach((e) => e.remove());
+      value = richText(copy);
+      // short values pick up stray breaks from wrapper divs ("Sep 17, 2026\n\n9:00 AM")
+      if (value.length < 80) value = value.replace(/\s*\n+\s*/g, " ").trim();
+    }
+    if (value === "" || (Array.isArray(value) && !value.length)) return;
+
+    out.fields[key] = value;
+
+    const panel = block.closest(".panel");
+    const heading = panel && panel.querySelector(".heading--banner");
+    const section = heading ? clean(heading.textContent) : "Other";
+    (out.panels[section] = out.panels[section] || {})[key] = value;
+  });
+
+  return Object.keys(out.fields).length > 0;
+}
+
 function parseDetail(text, contentType, sourceUrl, id, includeRawHtml) {
   const out = {
     id,
     scrapedAt: new Date().toISOString(),
     source: sourceUrl,
     fields: {},
+    panels: {},
     sections: {},
     raw: {},
   };
@@ -369,6 +499,14 @@ function parseDetail(text, contentType, sourceUrl, id, includeRawHtml) {
   }
 
   const doc = new DOMParser().parseFromString(text, "text/html");
+
+  // The precise path. Everything below is fallback for if Orbis restyles.
+  if (parseWaterlooWorks(doc, out)) {
+    out.raw.text = richText(doc.body).slice(0, 200000);
+    if (includeRawHtml) out.raw.html = text;
+    return out;
+  }
+
   const kv = {};
 
   // two-cell table rows: the dominant pattern in Orbis posting panels
@@ -440,8 +578,18 @@ async function fetchDetail(id, template) {
     body,
     credentials: "include",
   });
-  const text = await res.text();
-  return { status: res.status, contentType: res.headers.get("content-type") || "", text, url: res.url || url };
+  // WaterlooWorks serves ISO-8859-1, so res.text() (which assumes UTF-8)
+  // mangles accented characters — "Résumé" arrives as "R?sum?".
+  const contentType = res.headers.get("content-type") || "";
+  const buf = await res.arrayBuffer();
+  const m = /charset=([\w-]+)/i.exec(contentType);
+  let text;
+  try {
+    text = new TextDecoder(m ? m[1] : "utf-8").decode(buf);
+  } catch (_) {
+    text = new TextDecoder("utf-8").decode(buf);
+  }
+  return { status: res.status, contentType, text, url: res.url || url };
 }
 
 async function scrapeAll({ delayMs = 1500, includeRawHtml = false, skipExisting = true }) {
@@ -759,6 +907,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           id: p.id,
           status: p.status,
           bytes: p.bytes,
+        });
+        break;
+      }
+      case "debug:listDom": {
+        const info = debugListDom();
+        sendResponse({
+          ok: true,
+          filename: "waterlooworks-listdom.json",
+          json: JSON.stringify(info, null, 2),
+          tables: info.tables.length,
+          ids: info.idNodes.length,
         });
         break;
       }

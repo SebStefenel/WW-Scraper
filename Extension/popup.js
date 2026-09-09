@@ -172,7 +172,7 @@ function renderEvents(events, currentUrl) {
     div.innerHTML = `
       <div class="m">${e.method} ${short}</div>
       <div class="meta">${kind}${e.status || ""} ${e.contentType.split(";")[0] || ""} · ${e.bytes}b${
-      e.body ? " · body: " + e.body.slice(0, 90).replace(/</g, "&lt;") : ""
+      e.body ? "<br>body: " + e.body.slice(0, 500).replace(/</g, "&lt;") : ""
     }</div>`;
     const btn = document.createElement("button");
     btn.textContent = "Use as posting template";
@@ -263,6 +263,12 @@ $("idsManual").onclick = async () => {
   log(`Added ${r.added} pasted IDs — ${r.count} total.`, "ok");
   $("manualIds").value = "";
   refresh();
+};
+$("dumpList").onclick = async () => {
+  const r = await send("debug:listDom");
+  if (!r.ok) return log(r.error, "err");
+  await saveJson(r.filename, r.json);
+  log(`List DOM dumped: ${r.tables} tables, ${r.ids} ID nodes found.`, "ok");
 };
 $("idsClear").onclick = async () => {
   await send("ids:clear");

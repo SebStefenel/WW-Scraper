@@ -96,36 +96,51 @@
   // Orbis opens a posting by submitting a hidden form, which is a document
   // navigation rather than fetch/XHR — invisible to the hooks above. Capture it
   // on the way out so the posting request survives the page unload.
-  document.addEventListener(
-    "submit",
-    (ev) => {
-      const form = ev.target;
-      if (!form || form.tagName !== "FORM") return;
-      try {
-        const fd = new FormData(form);
-        // include the button that triggered the submit; Orbis often keys off it
-        const sub = ev.submitter;
-        if (sub && sub.name) fd.append(sub.name, sub.value || "");
+  function reportForm(form, submitter) {
+    if (!form || form.tagName !== "FORM") return;
+    try {
+      const fd = new FormData(form);
+      // include the button that triggered the submit; Orbis often keys off it
+      if (submitter && submitter.name) fd.append(submitter.name, submitter.value || "");
 
-        const pairs = [...fd.entries()]
-          .map(
-            ([k, v]) =>
-              `${encodeURIComponent(k)}=${encodeURIComponent(typeof v === "string" ? v : "")}`
-          )
-          .join("&");
+      const pairs = [...fd.entries()]
+        .map(
+          ([k, v]) =>
+            `${encodeURIComponent(k)}=${encodeURIComponent(typeof v === "string" ? v : "")}`
+        )
+        .join("&");
 
-        const method = String(form.method || "GET").toUpperCase();
-        let url = form.action || window.location.href;
-        let body = pairs;
-        if (method === "GET") {
-          url += (url.includes("?") ? "&" : "?") + pairs;
-          body = null;
-        }
-        post({ kind: "form", url, method, body, status: 0, contentType: "", preview: "" });
-      } catch (_) {}
-    },
-    true // capture phase, so we see it even if the page stops propagation
-  );
+      const method = String(form.method || "GET").toUpperCase();
+      let url = form.action || window.location.href;
+      let body = pairs;
+      if (method === "GET") {
+        url += (url.includes("?") ? "&" : "?") + pairs;
+        body = null;
+      }
+      post({ kind: "form", url, method, body, status: 0, contentType: "", preview: "" });
+    } catch (_) {}
+  }
+
+  // User-driven submits, capture phase so we see them even if propagation stops.
+  document.addEventListener("submit", (ev) => reportForm(ev.target, ev.submitter), true);
+
+  // Programmatic form.submit() fires NO submit event — a DOM quirk, and exactly
+  // how Orbis opens a posting. Without this hook the request is invisible.
+  const origSubmit = HTMLFormElement.prototype.submit;
+  HTMLFormElement.prototype.submit = function () {
+    reportForm(this, null);
+    return origSubmit.apply(this, arguments);
+  };
+
+  // requestSubmit() does fire the event, but only if the form is valid; hook it
+  // too so a rejected submit still shows up as an attempt.
+  if (HTMLFormElement.prototype.requestSubmit) {
+    const origRequestSubmit = HTMLFormElement.prototype.requestSubmit;
+    HTMLFormElement.prototype.requestSubmit = function (submitter) {
+      reportForm(this, submitter);
+      return origRequestSubmit.apply(this, arguments);
+    };
+  }
 
   XHR.prototype.send = function (body) {
     const meta = this.__wws || {};
