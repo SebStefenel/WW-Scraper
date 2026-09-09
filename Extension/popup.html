@@ -66,6 +66,7 @@
       .row + .row { margin-top: 7px; }
       label.inline { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 4px; }
       input[type="number"] { width: 62px; font: inherit; font-size: 12px; padding: 3px 5px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg); color: var(--fg); }
+      input[type="text"] { flex: 1; min-width: 0; font: inherit; font-size: 11px; padding: 3px 5px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg); color: var(--fg); }
       textarea { width: 100%; height: 46px; font: 11px/1.4 ui-monospace, Menlo, monospace; padding: 5px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg); color: var(--fg); resize: vertical; }
       #status { font-size: 12px; margin-bottom: 9px; padding: 6px 8px; border-radius: 6px; background: var(--panel); border: 1px solid var(--line); }
       #status b { font-variant-numeric: tabular-nums; }
@@ -147,6 +148,22 @@
       </div>
       <div class="row">
         <label class="inline"><input type="checkbox" id="autoSave" checked /> auto-save when a scrape finishes</label>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>5 · Send to ResuForge</legend>
+      <div class="row">
+        <button id="toResuforge" class="primary">Export to ResuForge</button>
+        <span class="hint">writes the JSON, then opens the import page</span>
+      </div>
+      <div class="row">
+        <label class="inline">at</label>
+        <input type="text" id="resuforgeUrl" placeholder="https://your-resuforge-url" spellcheck="false" />
+      </div>
+      <div class="hint">
+        Drop the file onto the page that opens. ResuForge normalizes the postings
+        and keeps them in that browser — nothing is uploaded.
       </div>
     </fieldset>
 

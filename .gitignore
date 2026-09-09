@@ -1,11 +1,11 @@
 # Scraped output — job data and anything revealing local paths stays out of git.
-waterlooworks-postings.json
 waterlooworks-postings-*.json
 waterlooworks-raw-*.json
 waterlooworks-listdom.json
+
+# Processing now happens in ResuForge, which downloads these. Ignored so a copy
+# left in this folder doesn't show up as untracked.
 postings.clean.json
 postings.csv
-out/
-*.local.json
 
 .DS_Store

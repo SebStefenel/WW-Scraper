@@ -115,7 +115,7 @@ async function findTab() {
 
 // Folder controls stay live even without a WaterlooWorks tab — picking an
 // output directory doesn't need one.
-const ALWAYS_ON = new Set(["chooseFolder", "clearFolder", "openTab", "autoSave"]);
+const ALWAYS_ON = new Set(["chooseFolder", "clearFolder", "openTab", "autoSave", "resuforgeUrl"]);
 
 function setEnabled(on) {
   document.querySelectorAll("button, input, textarea").forEach((el) => {
@@ -319,6 +319,48 @@ async function saveResults() {
 }
 
 $("save").onclick = saveResults;
+
+// ---- ResuForge handoff ----------------------------------------------------
+// ResuForge's WaterlooWorks section reads the same JSON this panel saves, so
+// the export is: write the file, then open the import page. The file never goes
+// through a server — it's picked up from disk by the page you're sent to.
+const RESUFORGE_DEFAULT = "https://frontend-ten-green-31.vercel.app";
+const RESUFORGE_KEY = "wws_resuforge_url";
+
+async function resuforgeBase() {
+  const stored = (await chrome.storage.local.get(RESUFORGE_KEY))[RESUFORGE_KEY];
+  const typed = $("resuforgeUrl").value.trim();
+  return (typed || stored || RESUFORGE_DEFAULT).replace(/\/+$/, "");
+}
+
+$("resuforgeUrl").onchange = async () => {
+  const v = $("resuforgeUrl").value.trim();
+  await chrome.storage.local.set({ [RESUFORGE_KEY]: v || RESUFORGE_DEFAULT });
+  if (!v) $("resuforgeUrl").value = RESUFORGE_DEFAULT;
+};
+
+$("toResuforge").onclick = async () => {
+  const r = await send("results:getJson");
+  if (!r.ok) return log(r.error, "err");
+  if (!r.count) return log("Nothing scraped yet — run a scrape first.", "err");
+
+  await saveJson(r.filename, r.json);
+
+  let base;
+  try {
+    base = await resuforgeBase();
+    // Reject anything that isn't a real http(s) URL before handing it to
+    // tabs.create, which would otherwise resolve a bare host against the
+    // extension's own origin.
+    const u = new URL(base);
+    if (u.protocol !== "https:" && u.protocol !== "http:") throw new Error("not http(s)");
+  } catch (_) {
+    return log(`"${$("resuforgeUrl").value}" isn't a valid URL — include https://.`, "err");
+  }
+
+  await chrome.tabs.create({ url: `${base}/#/ww` });
+  log(`Opened ResuForge — drop ${r.filename} onto the page.`, "ok");
+};
 $("dump").onclick = async () => {
   log("Fetching one raw posting…");
   const r = await send("debug:getRaw");
@@ -352,6 +394,9 @@ chrome.runtime.onMessage.addListener((msg) => {
     dirHandle = null;
   }
   renderFolder();
+
+  $("resuforgeUrl").value =
+    (await chrome.storage.local.get(RESUFORGE_KEY))[RESUFORGE_KEY] || RESUFORGE_DEFAULT;
 
   tabId = await findTab();
   if (tabId == null) {
