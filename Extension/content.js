@@ -940,6 +940,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           sendResponse({
             ok: true,
             skipped: true,
+            // Named even though nothing was written: the file on disk is still
+            // the current export, and callers want to point at it.
+            filename: RESULTS_FILENAME,
             count: state.results.size,
             sinceMs: Date.now() - last.at,
           });

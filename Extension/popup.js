@@ -299,20 +299,35 @@ $("clearFolder").onclick = async () => {
 
 let savingNow = false;
 
+// Resolves { ok, filename } once the export exists on disk — including when the
+// dedupe suppressed the write, since the file sitting there is already current.
+// Resolves { ok: false } when there is nothing to export; the reason is logged
+// here, so callers can just bail.
 async function saveResults() {
-  if (savingNow) return log("A save is already in progress.");
+  if (savingNow) {
+    log("A save is already in progress.");
+    return { ok: false };
+  }
   savingNow = true;
   try {
     // The destination is part of the dedupe key, so picking a new output folder
     // and saving again is a real save rather than a suppressed duplicate.
     const target = dirHandle ? dirHandle.name : "download";
     const r = await send("results:getJson", { target });
-    if (!r.ok) return log(r.error, "err");
-    if (r.skipped) {
-      return log(`Already saved ${Math.round(r.sinceMs / 1000)}s ago — nothing new to write.`);
+    if (!r.ok) {
+      log(r.error, "err");
+      return { ok: false };
     }
-    if (!r.count) return log("Nothing scraped yet.", "err");
+    if (r.skipped) {
+      log(`Already saved ${Math.round(r.sinceMs / 1000)}s ago — nothing new to write.`);
+      return { ok: true, filename: r.filename, skipped: true };
+    }
+    if (!r.count) {
+      log("Nothing scraped yet.", "err");
+      return { ok: false };
+    }
     await saveJson(r.filename, r.json);
+    return { ok: true, filename: r.filename };
   } finally {
     savingNow = false;
   }
@@ -340,11 +355,11 @@ $("resuforgeUrl").onchange = async () => {
 };
 
 $("toResuforge").onclick = async () => {
-  const r = await send("results:getJson");
-  if (!r.ok) return log(r.error, "err");
-  if (!r.count) return log("Nothing scraped yet — run a scrape first.", "err");
-
-  await saveJson(r.filename, r.json);
+  // Goes through saveResults so the export shares its in-flight latch and its
+  // save de-duplication — clicking this right after Save JSON must not write the
+  // same file twice, and a suppressed write still leaves a current file to open.
+  const saved = await saveResults();
+  if (!saved.ok) return;
 
   let base;
   try {
@@ -359,7 +374,7 @@ $("toResuforge").onclick = async () => {
   }
 
   await chrome.tabs.create({ url: `${base}/#/ww` });
-  log(`Opened ResuForge — drop ${r.filename} onto the page.`, "ok");
+  log(`Opened ResuForge — drop ${saved.filename} onto the page.`, "ok");
 };
 $("dump").onclick = async () => {
   log("Fetching one raw posting…");
