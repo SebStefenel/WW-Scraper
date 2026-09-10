@@ -579,11 +579,31 @@ function parseDetail(text, contentType, sourceUrl, id, includeRawHtml) {
 // ---------------------------------------------------------------------------
 // the scrape loop
 // ---------------------------------------------------------------------------
+// Three different walls can stand between a replayed request and a posting, and
+// only the first was being detected:
+//
+//   - UW's SSO (CAS / Duo) — the first four body patterns.
+//   - WaterlooWorks' own soft logout, HTTP 200 at notLoggedIn.htm. Nothing above
+//     matches it: no mention of CAS or Duo, its <title> is just "WaterlooWorks",
+//     and "notLoggedIn" does not contain the substring "login" ("logg" breaks
+//     it). That gap let a dead session look like 574 successful scrapes.
+//   - The session-timeout page at portalError.htm, whose body is the "You will
+//     be logged out in 60 seconds" modal.
+//
+// This is only how the failure gets *named*, though. What actually stops a run
+// is the empty-fields check in the scrape loop, which holds no matter what page
+// WaterlooWorks substitutes — worth keeping in mind before trusting this list to
+// be complete.
+//
+// The URL test is anchored to path segments rather than matching "auth" or
+// "login" anywhere in the string: waterlooworks.uwaterloo.ca is a long host and
+// loose substrings there invite false positives.
 function looksLikeLoginWall(text, url) {
+  const head = text.slice(0, 4000);
   return (
-    /central authentication service|duo security|sign in to waterloo|<title>[^<]*login/i.test(
-      text.slice(0, 4000)
-    ) || /login|adfs|auth/i.test(url)
+    /central authentication service|duo security|sign in to waterloo|<title>[^<]*login/i.test(head) ||
+    /keep me logged in|you will be logged out/i.test(head) ||
+    /not_?logged_?in|portalerror|\/login|\/signin|\/adfs|\/cas\/|\/auth\//i.test(url)
   );
 }
 
@@ -640,21 +660,49 @@ async function scrapeAll({ delayMs = 1500, includeRawHtml = false, skipExisting 
     try {
       const r = await fetchDetail(id, template);
 
-      if (r.status >= 400 || looksLikeLoginWall(r.text, r.url)) {
+      let failure = null;
+      let parsed = null;
+      if (r.status >= 400) failure = `HTTP ${r.status}`;
+      else if (looksLikeLoginWall(r.text, r.url)) failure = "login wall";
+
+      if (!failure) {
+        parsed = parseDetail(r.text, r.contentType, r.url, id, includeRawHtml);
+        // The backstop that matters, and the one invariant worth trusting: a real
+        // posting always yields fields. They come from the two-cell table rows
+        // every detail view is built from — Job Title, Organization, Work Term,
+        // Application Deadline — so no fields means this response is not a
+        // posting, whatever it is: an unrecognized logout page, a template that
+        // no longer addresses the detail view, markup that moved.
+        //
+        // Deliberately NOT "no fields AND no sections". The session-timeout page
+        // (portalError.htm) parses into two sections of its own — "Keep Me Logged
+        // In" and "Quick Navigation" — off the headings in its modal, so an
+        // and-condition reads those as partial success and stores the record.
+        // That is exactly how 137 junk rows got through alongside a good run.
+        if (Object.keys(parsed.fields).length === 0) {
+          failure = "no fields parsed";
+        }
+      }
+
+      if (failure) {
         consecutiveFailures++;
         emit({
           phase: "scrape",
           done,
           total: ids.length,
-          message: `id ${id}: HTTP ${r.status}${looksLikeLoginWall(r.text, r.url) ? " (login wall)" : ""}`,
+          message: `id ${id}: ${failure}`,
         });
         if (consecutiveFailures >= 3) {
           emit({
             phase: "scrape",
             done,
             total: ids.length,
+            // Name the URL the request actually landed on: when a session has
+            // lapsed this says notLoggedIn.htm, which is the whole diagnosis.
             message:
-              "Stopped after 3 failures in a row. Your session or the captured token may have expired — reload WaterlooWorks and re-learn the template.",
+              `Stopped after 3 failures in a row (last: ${failure}, from ${r.url}). ` +
+              "Your session or the captured token may have expired — reload " +
+              "WaterlooWorks, check you're still signed in, and re-learn the template.",
             finished: true,
             error: true,
           });
@@ -662,7 +710,6 @@ async function scrapeAll({ delayMs = 1500, includeRawHtml = false, skipExisting 
         }
       } else {
         consecutiveFailures = 0;
-        const parsed = parseDetail(r.text, r.contentType, r.url, id, includeRawHtml);
         const row = state.rows.get(id);
         parsed.listFields = row ? row.listFields : {};
         parsed.title = (row && row.title) || parsed.fields["Job Title"] || "";
