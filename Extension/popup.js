@@ -342,17 +342,19 @@ $("save").onclick = saveResults;
 const RESUFORGE_DEFAULT = "https://resuforge-app.vercel.app";
 const RESUFORGE_KEY = "wws_resuforge_url";
 
-async function resuforgeBase() {
-  const stored = (await chrome.storage.local.get(RESUFORGE_KEY))[RESUFORGE_KEY];
-  const typed = $("resuforgeUrl").value.trim();
-  return (typed || stored || RESUFORGE_DEFAULT).replace(/\/+$/, "");
+// The field is restored from saved settings on open and written back as it's
+// edited (see "remembered settings" below), so this only has to read it.
+function resuforgeBase() {
+  return ($("resuforgeUrl").value.trim() || RESUFORGE_DEFAULT).replace(/\/+$/, "");
 }
 
-$("resuforgeUrl").onchange = async () => {
-  const v = $("resuforgeUrl").value.trim();
-  await chrome.storage.local.set({ [RESUFORGE_KEY]: v || RESUFORGE_DEFAULT });
-  if (!v) $("resuforgeUrl").value = RESUFORGE_DEFAULT;
-};
+// Clearing the box means "go back to the default", not "no target at all".
+$("resuforgeUrl").addEventListener("change", () => {
+  if (!$("resuforgeUrl").value.trim()) {
+    $("resuforgeUrl").value = RESUFORGE_DEFAULT;
+    savePrefsSoon();
+  }
+});
 
 $("toResuforge").onclick = async () => {
   // Goes through saveResults so the export shares its in-flight latch and its
@@ -363,7 +365,7 @@ $("toResuforge").onclick = async () => {
 
   let base;
   try {
-    base = await resuforgeBase();
+    base = resuforgeBase();
     // Reject anything that isn't a real http(s) URL before handing it to
     // tabs.create, which would otherwise resolve a bare host against the
     // extension's own origin.
@@ -392,6 +394,73 @@ $("resultsClear").onclick = async () => {
   refresh();
 };
 
+// ---- remembered settings --------------------------------------------------
+// The popup is a brand-new document every time it opens, so whatever you typed
+// into it last time is gone unless it was written down. These are the controls
+// worth carrying over, with the defaults that popup.html ships — a control falls
+// back to its default only when nothing has been stored for it yet.
+//
+// manualIds is deliberately not in here: it's cleared the moment its IDs are
+// added, so restoring a stale paste would just be confusing. Neither is the
+// output folder, which is a FileSystemDirectoryHandle in IndexedDB (see the top
+// of this file) because permissions ride along with the handle.
+const PREFS_KEY = "wws_prefs";
+const PREFS = {
+  showAll: false,
+  maxPages: 40,
+  delayMs: 1500,
+  rawHtml: false,
+  skipExisting: true,
+  autoSave: true,
+  resuforgeUrl: RESUFORGE_DEFAULT,
+};
+
+const readControl = (el) => (el.type === "checkbox" ? el.checked : el.value);
+const writeControl = (el, v) => {
+  if (el.type === "checkbox") el.checked = !!v;
+  else el.value = v;
+};
+
+async function loadPrefs() {
+  const got = await chrome.storage.local.get([PREFS_KEY, RESUFORGE_KEY]);
+  const stored = got[PREFS_KEY] || {};
+  for (const [id, fallback] of Object.entries(PREFS)) {
+    const el = $(id);
+    if (!el) continue;
+    let v = stored[id];
+    // Carry over the ResuForge URL from when it had a key of its own, so an
+    // already-configured target isn't silently reset to the default.
+    if (v === undefined && id === "resuforgeUrl") v = got[RESUFORGE_KEY];
+    writeControl(el, v === undefined ? fallback : v);
+  }
+}
+
+// Debounced because this is wired to `input`, which fires per keystroke: typing
+// a URL shouldn't mean one storage write per character.
+let prefsTimer = null;
+function savePrefsSoon() {
+  clearTimeout(prefsTimer);
+  prefsTimer = setTimeout(() => {
+    const out = {};
+    for (const id of Object.keys(PREFS)) {
+      const el = $(id);
+      if (el) out[id] = readControl(el);
+    }
+    chrome.storage.local.set({ [PREFS_KEY]: out });
+  }, 250);
+}
+
+function watchPrefs() {
+  for (const id of Object.keys(PREFS)) {
+    const el = $(id);
+    if (!el) continue;
+    // Both events: `input` catches typing as it happens, `change` catches the
+    // commit of a control that only reports on blur.
+    el.addEventListener("input", savePrefsSoon);
+    el.addEventListener("change", savePrefsSoon);
+  }
+}
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type !== "wws:progress") return;
   if (msg.message) log(msg.message, msg.error ? "err" : msg.finished ? "ok" : null);
@@ -410,8 +479,8 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
   renderFolder();
 
-  $("resuforgeUrl").value =
-    (await chrome.storage.local.get(RESUFORGE_KEY))[RESUFORGE_KEY] || RESUFORGE_DEFAULT;
+  await loadPrefs();
+  watchPrefs();
 
   tabId = await findTab();
   if (tabId == null) {

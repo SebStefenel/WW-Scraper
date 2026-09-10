@@ -133,6 +133,10 @@ That's the one place likely to need adjustment on first run.
   login page), the scrape stops and tells you. Usually means the session or a
   captured CSRF token expired: reload WaterlooWorks and re-learn the template.
 - Only use this for postings your own account can already see.
+- The panel remembers its settings — max pages, delay, the checkboxes and
+  the ResuForge URL are restored next time you open it. The pasted-IDs box
+  isn't, since it's cleared as soon as those IDs are added, and neither is
+  the output folder, whose permission rides along with the handle itself.
 - `raw HTML` is off by default — turning it on makes the output several times
   larger but preserves markup like links and lists.
 
